@@ -59,6 +59,11 @@ model:
     s3_checkpoint_folder: checkpoints
     s3_log_folder: logs
     s3_log_file_name: training.log
+    # deepseek
+    compression_ratio: 4
+    num_experts: 4
+    num_shared_experts: 1
+    top_k: 2
 optimizer:
   accumulate_grad_in_fp32: true
   clip_grad: 1.0

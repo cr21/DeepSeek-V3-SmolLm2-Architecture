@@ -26,23 +26,40 @@ class RotaryPositionalEmbedding(nn.Module):
         Apply rotary positional embedding to the input tensor.
 
         Args:
-            x (torch.Tensor): Input tensor of shape # B, T, H, D
-            seq_len (int): Sequence length. #T
+            x (torch.Tensor): Input tensor of shape [B, T, H, D] or [B, T, D]
+            seq_len (int): Sequence length.
 
         Returns:
             torch.Tensor: Output tensor with rotary positional embeddings applied.
         """
-        B, T, H, H_D = x.shape
+        # Handle different input shapes
+        if len(x.shape) == 3:
+            B, T, D = x.shape
+            is_4d = False
+        else:
+            B, T, H, D = x.shape
+            is_4d = True
+            
+        # For 3D tensors, we need to ensure D is even
+        if not is_4d and D % 2 != 0:
+            raise ValueError(f"Feature dimension {D} must be divisible by 2 for RoPE")
 
         # Generate position indices
         position = torch.arange(T, dtype=torch.float32, device=x.device).unsqueeze(-1)
 
         # Generate frequencies
-        freqs = torch.exp(
-            torch.arange(0, H_D, 2, dtype=torch.float32, device=x.device) * 
-            -(torch.log(torch.tensor(self.theta)) / H_D)
-                                                                
-        )
+        if is_4d:
+            # For 4D tensors, use the head dimension
+            freqs = torch.exp(
+                torch.arange(0, D, 2, dtype=torch.float32, device=x.device) * 
+                -(torch.log(torch.tensor(self.theta)) / D)
+            )
+        else:
+            # For 3D tensors, use the full dimension
+            freqs = torch.exp(
+                torch.arange(0, D, 2, dtype=torch.float32, device=x.device) * 
+                -(torch.log(torch.tensor(self.theta)) / D)
+            )
 
         # Compute sinusoids
         sinusoid = position * freqs
@@ -50,13 +67,22 @@ class RotaryPositionalEmbedding(nn.Module):
         cos = torch.cos(sinusoid)
 
         # Reshape sin and cos to match the input tensor's shape
-        sin = sin.unsqueeze(0).unsqueeze(2)  # Shape: (1, T, 1, D // 2)
-        cos = cos.unsqueeze(0).unsqueeze(2)  # Shape: (1, T, 1, D // 2)
+        if is_4d:
+            sin = sin.unsqueeze(0).unsqueeze(2)  # Shape: (1, T, 1, D // 2)
+            cos = cos.unsqueeze(0).unsqueeze(2)  # Shape: (1, T, 1, D // 2)
+        else:
+            sin = sin.unsqueeze(0)  # Shape: (1, T, D // 2)
+            cos = cos.unsqueeze(0)  # Shape: (1, T, D // 2)
 
         # Apply rotary embeddings
         x_rotated = x.clone()
-        x_rotated[..., 0::2] = x[..., 0::2] * cos - x[..., 1::2] * sin
-        x_rotated[..., 1::2] = x[..., 1::2] * cos + x[..., 0::2] * sin
+        
+        if is_4d:
+            x_rotated[..., 0::2] = x[..., 0::2] * cos - x[..., 1::2] * sin
+            x_rotated[..., 1::2] = x[..., 1::2] * cos + x[..., 0::2] * sin
+        else:
+            x_rotated[..., 0::2] = x[..., 0::2] * cos - x[..., 1::2] * sin
+            x_rotated[..., 1::2] = x[..., 1::2] * cos + x[..., 0::2] * sin
 
         return x_rotated
 
@@ -71,7 +97,7 @@ class MultiHeadLatentAttention(nn.Module):
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})"
             )
-        self.head_dim =  self.hidden_size // self.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
         self.latent_dim = self.hidden_size // self.config['compression_ratio']
 
         # Matrix is decomposed into D and U matrix 
@@ -83,7 +109,7 @@ class MultiHeadLatentAttention(nn.Module):
         # UnCompression k projection matrix
         self.k_proj_U = nn.Linear(self.latent_dim, self.hidden_size//2, bias=False)
         # UnCompression v projection matrix
-        self.v_proj_U = nn.Linear(self.latent_dim, self.hidden_size//2, bias=False)    
+        self.v_proj_U = nn.Linear(self.latent_dim, self.hidden_size, bias=False)    
         # UnCompression Q projection matrix
         self.q_proj_U = nn.Linear(self.latent_dim, self.hidden_size//2, bias=False)
 
@@ -93,12 +119,11 @@ class MultiHeadLatentAttention(nn.Module):
         # output projection matrix
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        self.rotary_emb = RotaryPositionalEmbedding(self.head_dim//2, self.config['rope_theta'])
-
-        
+        self.rotary_emb = RotaryPositionalEmbedding(self.hidden_size//2, self.config['rope_theta'])
 
     def forward(self, x, attn_mask=None):
         B, T, C = x.size() # Batch Size, Sequence Length, Hidden Size
+        
         # Compression KV Projection Matrix
         kv_d = self.kv_proj_D(x) # [B, T, Latent Dim]
         # Compression Q Projection Matrix
@@ -107,149 +132,168 @@ class MultiHeadLatentAttention(nn.Module):
         # Uncompress KV & Q Projection Matrix
         k_proj_2 = self.k_proj_U(kv_d) # [B, T, Hidden Size//2]
         q_proj_2 = self.q_proj_U(q_d) # [B, T, Hidden Size//2]
-        v = self.v_proj_U(kv_d) # [B, T, Hidden Size//2]
+        v = self.v_proj_U(kv_d) # [B, T, Hidden Size]
 
+        # Rope components
+        k_rope_2 = self.rope_k(x) # [B, T, Hidden Size//2]
+        q_rope_2 = self.rope_q(q_d) # [B, T, Hidden Size//2]
 
+        # Apply ROPE to the rope components
+        k_rope_2 = self.rotary_emb(k_rope_2, T) # [B, T, Hidden Size//2]
+        q_rope_2 = self.rotary_emb(q_rope_2, T) # [B, T, Hidden Size//2]
 
-        # Rope
-        k_rope_2  = self.rotary_emb(x, T) # [B, T, Hidden Size//2]
-        q_rope_2 = self.rotary_emb(q_d, T) # [B, T, Hidden Size//2]
-
-        # Reshape Components for Multi-Head Attention before ROPE
+        # Reshape Components for Multi-Head Attention
         k_proj_2 = k_proj_2.view(B, T, self.num_attention_heads, self.head_dim//2)
         k_rope_2 = k_rope_2.view(B, T, self.num_attention_heads, self.head_dim//2)
         q_proj_2 = q_proj_2.view(B, T, self.num_attention_heads, self.head_dim//2)
         q_rope_2 = q_rope_2.view(B, T, self.num_attention_heads, self.head_dim//2)
-
-        
-
-        # Apply ROPE
-        k_rope_2 = self.rotary_emb(k_rope_2, T)
-        q_rope_2 = self.rotary_emb(q_rope_2, T)
 
         # Concatenate Components
         k = torch.cat((k_proj_2, k_rope_2), dim=-1) # [B, T, H, D]
         q = torch.cat((q_proj_2, q_rope_2), dim=-1) # [B, T, H, D]
         v = v.view(B, T, self.num_attention_heads, self.head_dim)
 
-        # Reshape Components for Multi-Head Attention after ROPE
+        # Reshape Components for Multi-Head Attention
         k = k.transpose(1, 2) # [B, H, T, D]
         q = q.transpose(1, 2) # [B, H, T, D]
         v = v.transpose(1, 2) # [B, H, T, D]
 
         # Apply Scaled Dot-Product Attention
         attn_out = F.scaled_dot_product_attention(q, k, v, 
-                                                  dropout=0.0, 
+                                                  dropout_p=0.0, 
                                                   is_causal=True,
-                                                   attn_mask=attn_mask)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C) # [B, T, H, D]
-        return self.o_proj(attn_out) # [B,T,D]
-        
-        
-        
-        
-        return x
+                                                  attn_mask=attn_mask)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C) # [B, T, C]
+        return self.o_proj(attn_out) # [B, T, C]
 
-class LlamaSdpaAttention(nn.Module):
-    """
-    (self_attn): LlamaAttention(
-          (q_proj): Linear(in_features=576, out_features=576, bias=False)
-          (k_proj): Linear(in_features=576, out_features=576, bias=False)
-          (v_proj): Linear(in_features=576, out_features=576, bias=False)
-          (o_proj): Linear(in_features=576, out_features=576, bias=False)
-    )
-    """
-    def __init__(self, config, rotary_emb):
+class DeepSeekExpertLayer(nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
         super().__init__()
-        self.config = config
-        self.num_attention_heads = self.config['num_attention_heads']
-        self.hidden_size = self.config['hidden_size']
-        # Ensure the hidden size is divisible by the number of attention heads
-        if self.hidden_size % self.num_attention_heads != 0:
-            raise ValueError(
-                f"hidden_size ({self.hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})"
-            )
-        
-        self.head_dim =  self.hidden_size // self.num_attention_heads
-        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)  # D,D
-        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)   # D,D
-        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)   # D,D
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)   # D,D
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = SiLU()
+    
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-        # Convert the mask to boolean type when creating it
-        # self.register_buffer("mask", 
-        #                    torch.triu(torch.ones(self.config['max_position_embeddings'], 
-        #                                        self.config['max_position_embeddings']),
-        #                             diagonal=1))  # Convert to boolean
-        
-        self.rotary_pos_emb = rotary_emb
+class DeepSeekMOE(nn.Module):
+    """
+    A Mixture of Experts (MoE) layer that routes input through a set of expert layers.
 
+    This class implements a mixture of experts mechanism where a subset of experts is selected 
+    for each input token based on learned routing logits. The output is a combination of the 
+    shared experts and the routed experts, allowing for efficient computation and increased 
+    model capacity.
+
+    Attributes:
+        hidden_size (int): The size of the hidden layer.
+        intermediate_size (int): The size of the intermediate layer.
+        num_experts (int): Total number of experts available.
+        num_shared_experts (int): Number of shared experts that are used for all inputs.
+        top_k (int): The number of top experts to route each input to.
+        shared_experts (nn.ModuleList): List of shared expert layers.
+        routed_experts (nn.ModuleList): List of routed expert layers.
+        routing_fn (nn.Linear): Linear layer for computing routing logits.
+        routing_bias (nn.Parameter): Bias for the routing logits.
+
+    Methods:
+        forward(x): Forward pass through the MoE layer, routing input through selected experts.
+    """
+    def __init__(self, hidden_size, intermediate_size, num_experts, num_shared_experts, top_k):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        self.num_routed_experts = num_experts - num_shared_experts
+        self.shared_experts = nn.ModuleList(
+            [DeepSeekExpertLayer(self.hidden_size, self.intermediate_size) for _ in range(self.num_shared_experts)]
+        )
+        self.routed_experts = nn.ModuleList(
+            [DeepSeekExpertLayer(self.hidden_size, self.intermediate_size) for _ in range(self.num_routed_experts)]
+        )
+        
+        # Routing Function
+        self.routing_fn = nn.Linear(self.hidden_size, self.num_routed_experts, bias=False)
+        self.routing_bias = nn.Parameter(torch.zeros(self.num_routed_experts))
     def forward(self, x):
         B, T, C = x.size()
+        shared_out = sum(expert(x) for expert in self.shared_experts)
+        if self.num_shared_experts>1:
+            shared_out = shared_out/self.num_shared_experts # normalize the shared experts
+        # calculate the routing function
+        routing_logits = self.routing_fn(x) + self.routing_bias # [B, T, num_routed_experts]
+        # GEt Topk Experts per token
+        routing_probs = torch.sigmoid(routing_logits) # [B, T, num_routed_experts]
+        scores, indices = torch.topk(routing_probs, self.top_k, dim=-1) # [B, T, top_k]
+        # normalize the top k scores
+        scores  = scores/torch.sum(scores, dim=-1, keepdim=True)
 
-        q = self.q_proj(x)  # B,T,D
-        k = self.k_proj(x)  # B,T,D/H
-        v = self.v_proj(x)  # B,T,D/H
+        # process the routed experts
+        #combined_output = torch.zeros(B, T, C, device=x.device)
+        combined_output = torch.zeros_like(x)
+        for i in range(self.top_k):
+            expert_idx = indices[:, :, i] # [B, T, top_k]
+            expert_scores = scores[...,i:i+1]
 
-        q = q.view(B, T, self.num_attention_heads, self.head_dim) # B,T,H,D
-        k = k.view(B, T, self.num_key_value_heads, self.head_dim) # B,T,H,D
-        v = v.view(B, T, self.num_key_value_heads, self.head_dim) # B,T,H,D
-
-        q = q.transpose(1,2) # B,H,T,D
-        k = k.transpose(1,2) # B,num_key_value_heads,T,D
-        v = v.transpose(1,2) # B,num_key_value_heads,T,D
-
-        # apply rotary positional embedding
-        q = self.rotary_pos_emb(q, T)
-        k = self.rotary_pos_emb(k, T)
-
-        # Repeat k/v heads if num_key_value_heads < num_attention_heads
-        if self.num_key_value_heads != self.num_attention_heads:
-            k = k.repeat_interleave(self.num_attention_heads // self.num_key_value_heads, dim=1) # B,kv_head,T,D -> B,H,T,D
-            v = v.repeat_interleave(self.num_attention_heads // self.num_key_value_heads, dim=1) # B,kv_head,T,D -> B,H,T,D
-
-        # Manual attention Stats
-        # Q(B,H,T,D) @K.T(B,H,D,T) = Q.K_T (B,H,T,T)
-        # attn_scores = q @ k.transpose(-2,-1) # B,H,T,T
-        # mask_bool = self.mask[:T,:T].bool() # T,T
-        # attn_scores.masked_fill_(mask_bool, -torch.inf) # B,H,T,T
-        # attn_weights = F.softmax(attn_scores/k.size(-1)**0.5, dim=-1) # B,H,T,T
-        # context_vector = attn_weights @ v # B,H,T,T * B,H,T,D = B,H,T,D
-        # context_vector = context_vector.transpose(1,2) # B,T,H,D
-        # context_vector = context_vector.contiguous().view(B,T,C) # B,T,H,D -> B,T,D
-        # Manual attention Stats ENDS
-
-        # Scaled dot-product attention STARTS   
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        context_vector = attn_out.transpose(1,2).reshape(B,T,C)
-        # Scaled dot-product attention ENDS
-
-        context_vector = self.o_proj(context_vector)
+            # process the routed experts
+            for j in range(self.num_routed_experts):
+                mask = (expert_idx == j) # [B, T, 1]
+                if mask.any():
+                    expert_input = x[mask] # [B, T, 1, C]
+                    expert_output = self.routed_experts[j](expert_input)
+                    combined_output[mask] += expert_scores[mask] * expert_output
+                
+        final_output = shared_out + combined_output
+        return final_output
         
-        return context_vector
-
 
 class LlamaMLP(nn.Module):
     """
     (mlp): LlamaMLP(
-          (gate_proj): Linear(in_features=576, out_features=1536, bias=False)
-          (up_proj): Linear(in_features=576, out_features=1536, bias=False)
-          (down_proj): Linear(in_features=1536, out_features=576, bias=False)
-          (act_fn): SiLU()
+        (moe): DeepSeekMOE(
+          (shared_experts): ModuleList(
+            (0): DeepSeekExpertLayer(
+              (gate_proj): Linear(in_features=576, out_features=1536, bias=False)
+              (up_proj): Linear(in_features=576, out_features=1536, bias=False)
+              (down_proj): Linear(in_features=1536, out_features=576, bias=False)
+              (act_fn): SiLU()
+            )
+          )
+          (routed_experts): ModuleList(
+            (0-2): 3 x DeepSeekExpertLayer(
+              (gate_proj): Linear(in_features=576, out_features=1536, bias=False)
+              (up_proj): Linear(in_features=576, out_features=1536, bias=False)
+              (down_proj): Linear(in_features=1536, out_features=576, bias=False)
+              (act_fn): SiLU()
+            )
+          )
+          (routing_fn): Linear(in_features=576, out_features=3, bias=False)
         )
+      )
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.gate_proj = nn.Linear(self.config['hidden_size'], self.config['intermediate_size'], bias=False)
-        self.up_proj = nn.Linear(self.config['hidden_size'], self.config['intermediate_size'], bias=False)
-        self.down_proj = nn.Linear(self.config['intermediate_size'], self.config['hidden_size'], bias=False)
-        self.act_fn = SiLU()
+        self.moe = DeepSeekMOE(hidden_size=config['hidden_size'],
+                                intermediate_size=config['intermediate_size'],
+                                num_experts=config['num_experts'],
+                                num_shared_experts= config['num_shared_experts'], 
+                                top_k=config['top_k'])
+        # self.gate_proj = nn.Linear(self.config['hidden_size'], self.config['intermediate_size'], bias=False)
+        # self.up_proj = nn.Linear(self.config['hidden_size'], self.config['intermediate_size'], bias=False)
+        # self.down_proj = nn.Linear(self.config['intermediate_size'], self.config['hidden_size'], bias=False)
+        # self.act_fn = SiLU()
     def forward(self, x):
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        down = self.down_proj(self.act_fn(gate)*up)
-        return down 
+        return self.moe(x)
+        # gate = self.gate_proj(x)
+        # up = self.up_proj(x)
+        # down = self.down_proj(self.act_fn(gate)*up)
+        # return down 
     
 class LlamaRMSNorm(nn.Module):
     """
@@ -270,12 +314,12 @@ class LlamaRMSNorm(nn.Module):
         return  self.weight *rms * x
     
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, rotary_emb):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.self_attn = LlamaAttention(self.config, rotary_emb)
-        self.mlp = LlamaMLP(self.config)
+        self.self_attn = MultiHeadLatentAttention(self.config)
         self.input_layernorm = LlamaRMSNorm(self.config)
+        self.mlp = LlamaMLP(self.config)
         self.post_attention_layernorm = LlamaRMSNorm(self.config)   
     
     def forward(self, x):
@@ -297,7 +341,7 @@ class LlamaModel(nn.Module):
         self.config = config['model_config']
         self.embed_tokens = nn.Embedding(self.config['vocab_size'], self.config['hidden_size'])
         self.rotary_emb = RotaryPositionalEmbedding(self.config['hidden_size'], self.config['rope_theta'])
-        self.layers = nn.ModuleList([LlamaDecoderLayer(self.config, self.rotary_emb) for _ in range(self.config['num_hidden_layers'])])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(self.config) for _ in range(self.config['num_hidden_layers'])])
         self.norm = LlamaRMSNorm(self.config)
         self.lm_head = nn.Linear(self.config['hidden_size'], self.config['vocab_size'], bias=False)
         
