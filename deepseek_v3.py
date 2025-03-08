@@ -233,6 +233,9 @@ class DeepSeekMOE(nn.Module):
         # process the routed experts
         #combined_output = torch.zeros(B, T, C, device=x.device)
         combined_output = torch.zeros_like(x)
+
+        # Calculate expert load for all experts
+        expert_load = torch.zeros(self.num_routed_experts, device=x.device)
         for i in range(self.top_k):
             expert_idx = indices[:, :, i] # [B, T, top_k]
         
@@ -241,13 +244,41 @@ class DeepSeekMOE(nn.Module):
             for j in range(self.num_routed_experts):
                 mask = (expert_idx == j) # [B, T, 1]
                 if mask.any():
+                    # Track expert usage (load)
+                    expert_load[j] += mask.sum().float() / (B * T * self.top_k)
+                    # Process tokens through this expert
                     expert_input = x[mask] # [B, T, 1, C]
                     expert_output = self.routed_experts[j](expert_input)
                     combined_output[mask] += expert_scores[mask] * expert_output
         final_output = shared_out + combined_output
-        return final_output
+        router_z_loss = self.update_bias_terms(expert_load)
+        return final_output, router_z_loss
+    
+    def update_bias_terms(self, expert_load, router_z_loss_coef=0.001):
+        # Balance expert routing by adjusting the bias terms
+        # Target load is uniform distribution across experts
+        target_load = 1.0 / self.num_routed_experts
         
-    def update_bias_terms(self, expert_load):
+        # Calculate load imbalance for each expert
+        load_diff = expert_load - target_load
+        
+        # Dynamic update rate based on the magnitude of imbalance
+        # Larger imbalances get larger corrections
+        update_rate = 0.1 * torch.abs(load_diff)
+        
+        # Update the routing bias to counteract imbalance
+        # Decrease bias for overutilized experts, increase for underutilized
+        self.routing_bias.data -= update_rate * load_diff
+        
+        # Calculate the router z-loss to discourage extreme routing probabilities
+        # This helps stabilize training without auxiliary losses
+        # Z-loss encourages routing probabilities to stay away from 0 and 1
+        router_z_loss = router_z_loss_coef * torch.mean(torch.log(torch.sum(
+            torch.exp(self.routing_fn.weight), dim=-1)))
+        
+        return router_z_loss
+
+    def update_bias_terms_old(self, expert_load, ):
         # adjust the bias terms based on the expert load
         target_load = 1/self.num_experts
         load_diff = expert_load - target_load
@@ -298,7 +329,8 @@ class LlamaMLP(nn.Module):
         # self.down_proj = nn.Linear(self.config['intermediate_size'], self.config['hidden_size'], bias=False)
         # self.act_fn = SiLU()
     def forward(self, x):
-        return self.moe(x)
+        output, router_z_loss = self.moe(x)
+        return output, router_z_loss
         # gate = self.gate_proj(x)
         # up = self.up_proj(x)
         # down = self.down_proj(self.act_fn(gate)*up)
@@ -338,9 +370,9 @@ class LlamaDecoderLayer(nn.Module):
         x = x + residual
         residual = x
         x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
+        x, router_z_loss = self.mlp(x)
         x = x + residual
-        return x 
+        return x, router_z_loss
     
 class DeepSeekV3Model(nn.Module):
     def __init__(self, config):
@@ -360,14 +392,18 @@ class DeepSeekV3Model(nn.Module):
     
     def forward(self, x, y=None):
         x = self.embed_tokens(x)
+        total_router_z_loss = 0.0
         for layer in self.layers:
-            x = layer(x)
+            x, router_z_loss = layer(x)
+            total_router_z_loss += router_z_loss
         x = self.norm(x)
         logits = self.lm_head(x) # B,T,V
         logits = logits.view(-1, logits.size(-1))  # Shape: [B*T, V] # 20, 49152
         if y is not None:
             y = y.view(-1)  # Shape: [B*T] # 20
-            loss = torch.nn.functional.cross_entropy(logits, y)
+            ce_loss = torch.nn.functional.cross_entropy(logits, y)
+            # Combine CE loss with router z-loss
+            loss = ce_loss + total_router_z_loss
             return logits, loss
         else:
             return logits, None

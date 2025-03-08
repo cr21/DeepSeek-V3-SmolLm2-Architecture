@@ -265,7 +265,7 @@ def train_model(config, model, train_loader, test_loader, optimizer, device, num
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 logits, original_loss = model(input_batch, target_batch)
             
-                # Scale loss for gradient accumulation
+            # Scale loss for gradient accumulation - moved outside autocast context
             scaled_loss = original_loss / gradient_accumulation_steps
             scaled_loss.backward()
             
@@ -302,7 +302,11 @@ def train_model(config, model, train_loader, test_loader, optimizer, device, num
                 logger.info(f"scheduler lr: {current_lr:.8f}")
                 
                 # Generate sample text
-                encoded_text = tokenizer.encode(start_context, return_tensors="pt")
+                start_context_list = ["In today's ever-evolving world, technology has become an integral part of our lives","Once upon a time, there was a friendly agency called Gaudette Insurance Agency, Inc. They help","A couple of years ago, I was working as an extra on the set of a low-budget British film.","Introduction: The Art of Crafting Vegan Sandwich Delights Sandwiches occupy a unique space in","Meet Chris, a superhero of supplies! Just like how Batman protects Gotham City","Identity formation is a complex and multifaceted process that involves the development of",    "With the development of science and technology, computer has become more and more ","Just as there are many variants and forms of electronic malware and Internet-based ","Correctly identifying what is causing a problem is the most important step in pest control.","Lobster, California spiny The California Spiny Lobster fishery is a small but locally ","Bees are vital for pollination. You can buy leafcutter bee houses to attract ","Feeling Alone Together: Exploring Alienation and Isolation in Literature", "Imagine if someone got their hands on dangerous weapons","Once upon a time, in a colorful town called Popville, ","he bell above the door jangled as Sarah walked into her family's hardware store"]
+                # Randomly select a prompt from the list
+                random_prompt = np.random.choice(start_context_list)
+                logger.info(f"Selected prompt: {random_prompt}")
+                encoded_text = tokenizer.encode(random_prompt, return_tensors="pt")
                 random_topk = np.random.randint(1, 10)
                 logger.info(f"random_topk: {random_topk}")
                 random_temperature = np.random.uniform(0.7, 0.9)
