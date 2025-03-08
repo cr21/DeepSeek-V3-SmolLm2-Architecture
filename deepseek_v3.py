@@ -123,41 +123,39 @@ class MultiHeadLatentAttention(nn.Module):
 
     def forward(self, x, attn_mask=None):
         B, T, C = x.size() # Batch Size, Sequence Length, Hidden Size
-        
         # Compression KV Projection Matrix
         kv_d = self.kv_proj_D(x) # [B, T, Latent Dim]
         # Compression Q Projection Matrix
         q_d = self.q_proj_D(x) # [B, T, Latent Dim]
-       
         # Uncompress KV & Q Projection Matrix
         k_proj_2 = self.k_proj_U(kv_d) # [B, T, Hidden Size//2]
         q_proj_2 = self.q_proj_U(q_d) # [B, T, Hidden Size//2]
         v = self.v_proj_U(kv_d) # [B, T, Hidden Size]
-
+        
         # Rope components
         k_rope_2 = self.rope_k(x) # [B, T, Hidden Size//2]
         q_rope_2 = self.rope_q(q_d) # [B, T, Hidden Size//2]
-
+        
         # Apply ROPE to the rope components
         k_rope_2 = self.rotary_emb(k_rope_2, T) # [B, T, Hidden Size//2]
         q_rope_2 = self.rotary_emb(q_rope_2, T) # [B, T, Hidden Size//2]
-
+        
         # Reshape Components for Multi-Head Attention
         k_proj_2 = k_proj_2.view(B, T, self.num_attention_heads, self.head_dim//2)
         k_rope_2 = k_rope_2.view(B, T, self.num_attention_heads, self.head_dim//2)
         q_proj_2 = q_proj_2.view(B, T, self.num_attention_heads, self.head_dim//2)
         q_rope_2 = q_rope_2.view(B, T, self.num_attention_heads, self.head_dim//2)
-
+        
         # Concatenate Components
         k = torch.cat((k_proj_2, k_rope_2), dim=-1) # [B, T, H, D]
         q = torch.cat((q_proj_2, q_rope_2), dim=-1) # [B, T, H, D]
         v = v.view(B, T, self.num_attention_heads, self.head_dim)
-
+        
         # Reshape Components for Multi-Head Attention
         k = k.transpose(1, 2) # [B, H, T, D]
         q = q.transpose(1, 2) # [B, H, T, D]
         v = v.transpose(1, 2) # [B, H, T, D]
-
+        
         # Apply Scaled Dot-Product Attention
         attn_out = F.scaled_dot_product_attention(q, k, v, 
                                                   dropout_p=0.0, 
@@ -232,14 +230,13 @@ class DeepSeekMOE(nn.Module):
         scores, indices = torch.topk(routing_probs, self.top_k, dim=-1) # [B, T, top_k]
         # normalize the top k scores
         scores  = scores/torch.sum(scores, dim=-1, keepdim=True)
-
         # process the routed experts
         #combined_output = torch.zeros(B, T, C, device=x.device)
         combined_output = torch.zeros_like(x)
         for i in range(self.top_k):
             expert_idx = indices[:, :, i] # [B, T, top_k]
+        
             expert_scores = scores[...,i:i+1]
-
             # process the routed experts
             for j in range(self.num_routed_experts):
                 mask = (expert_idx == j) # [B, T, 1]
@@ -247,11 +244,23 @@ class DeepSeekMOE(nn.Module):
                     expert_input = x[mask] # [B, T, 1, C]
                     expert_output = self.routed_experts[j](expert_input)
                     combined_output[mask] += expert_scores[mask] * expert_output
-                
         final_output = shared_out + combined_output
         return final_output
         
+    def update_bias_terms(self, expert_load):
+        # adjust the bias terms based on the expert load
+        target_load = 1/self.num_experts
+        load_diff = expert_load - target_load
+        # dyanamic update the bias based on the load imbalance
+        update_rate = 0.1 * torch.abs(load_diff)
+        # dyanmic update the bias terms using update rate
+        self.routing_bias = self.routing_bias - update_rate * load_diff
 
+        # for i in range(self.num_routed_experts):
+        #     if expert_load[i] < target_load:
+        #         self.routing_bias[i] -= 1
+        #     else:
+        #         self.routing_bias[i] += 1
 class LlamaMLP(nn.Module):
     """
     (mlp): LlamaMLP(
@@ -327,14 +336,13 @@ class LlamaDecoderLayer(nn.Module):
         x = self.input_layernorm(x)
         x = self.self_attn(x)
         x = x + residual
-
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
         x = x + residual
         return x 
     
-class LlamaModel(nn.Module):
+class DeepSeekV3Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.init_method = config['init_method']
@@ -356,9 +364,9 @@ class LlamaModel(nn.Module):
             x = layer(x)
         x = self.norm(x)
         logits = self.lm_head(x) # B,T,V
-        logits = logits.view(-1, logits.size(-1))  # Shape: [B*T, V]
+        logits = logits.view(-1, logits.size(-1))  # Shape: [B*T, V] # 20, 49152
         if y is not None:
-            y = y.view(-1)  # Shape: [B*T]
+            y = y.view(-1)  # Shape: [B*T] # 20
             loss = torch.nn.functional.cross_entropy(logits, y)
             return logits, loss
         else:
@@ -407,7 +415,7 @@ class LlamaModel(nn.Module):
 #     print(config.keys())
 #     model_config = config['model']['model_config']
 #     print(model_config)
-#     model = LlamaModel(config['model'])
+#     model = DeepSeekV3Model(config['model'])
 #     x_tokens = torch.randint(0, model_config['vocab_size'], (1, 10))  # Generate random token indices
 #     print(model(x_tokens).shape)
 #     total_params = sum(p.numel() for p in model.parameters())

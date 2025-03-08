@@ -1,4 +1,5 @@
 from SmolLm3 import LlamaModel
+from deepseek_v3 import DeepSeekV3Model
 import torch
 import yaml
 from transformers import AutoTokenizer
@@ -355,7 +356,7 @@ if __name__ == "__main__":
     # Empty cache before model creation
     torch.cuda.empty_cache()
     
-    model = LlamaModel(config['model'])
+    model = DeepSeekV3Model(config['model'])
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Enable gradient checkpointing for memory efficiency

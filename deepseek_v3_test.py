@@ -1,4 +1,4 @@
-from deepseek_v3 import LlamaModel
+from deepseek_v3 import DeepSeekV3Model
 import torch
 import yaml
 
@@ -27,7 +27,7 @@ def test_deepseek_model():
     # Initialize the model
     model_config = config['model']
     print(model_config)
-    model = LlamaModel(model_config)
+    model = DeepSeekV3Model(model_config)
     print(model)
     # Create dummy input
     batch_size = 2
@@ -36,6 +36,7 @@ def test_deepseek_model():
     dummy_input = torch.randint(0, model_config['model_config']['vocab_size'], (batch_size, seq_length))
 
     # Forward pass
+    print(dummy_input.shape)
     logits, loss = model(dummy_input)
 
     # Check output shapes
