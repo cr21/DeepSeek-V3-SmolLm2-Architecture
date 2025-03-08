@@ -55,7 +55,7 @@ model:
     tie_word_embeddings: true
     use_cache: true
     vocab_size: 49152
-    s3_bucket: smollm2-train-jan-25-era3
+    s3_bucket: deepseek-v3-train-mar-2025
     s3_checkpoint_folder: checkpoints
     s3_log_folder: logs
     s3_log_file_name: training.log
