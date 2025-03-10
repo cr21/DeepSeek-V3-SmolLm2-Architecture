@@ -223,17 +223,17 @@ def train_model(config, model, train_loader, test_loader, optimizer, device, num
     total_loss = 0
     tokens_seen, global_step = 0, -1
     
-    # Adjusted gradient accumulation setup
-    actual_batch_size = config['tokens']['micro_batch_size']  # Now 16
-    effective_batch_size_multiplier = 2  # Reduced from 4 to maintain reasonable memory usage
+    # Adjusted gradient accumulation setup for batch size 8
+    actual_batch_size = config['tokens']['micro_batch_size']  # Now 8
+    effective_batch_size_multiplier = 1  # Adjusted for batch size 8
     target_batch_size = effective_batch_size_multiplier * config['tokens']['micro_batch_size']
     gradient_accumulation_steps = target_batch_size // actual_batch_size
     
-    # Adjusted learning rate parameters for new batch size
+    # Learning rate parameters adjusted for batch size 8
     max_lr = 3e-4  # Keep the same max learning rate
-    warmup_steps = 3000  # Increase warmup steps for longer training
-    max_steps = 60000  # Set to match 10 hours of training
-    min_lr = max_lr * 0.05  # Reduce minimum LR to 5% of max (was 10%)
+    warmup_steps = 3000  # Keep warmup steps
+    max_steps = 60000  # Keep max steps
+    min_lr = max_lr * 0.05  # Keep minimum LR at 5% of max
     
     # Create LambdaLR scheduler with the improved lambda function
     lr_lambda = lambda step: get_lr_lambda(step, warmup_steps, max_steps, max_lr)
@@ -252,7 +252,6 @@ def train_model(config, model, train_loader, test_loader, optimizer, device, num
     # Add these near the start of training loop
     torch.cuda.empty_cache()
     torch.backends.cudnn.benchmark = True
-    
     for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()  # Zero gradients at start of epoch
@@ -306,6 +305,7 @@ def train_model(config, model, train_loader, test_loader, optimizer, device, num
                 # Randomly select a prompt from the list
                 random_prompt = np.random.choice(start_context_list)
                 logger.info(f"Selected prompt: {random_prompt}")
+                logger.info(f"+++"*30)
                 encoded_text = tokenizer.encode(random_prompt, return_tensors="pt")
                 random_topk = np.random.randint(1, 10)
                 logger.info(f"random_topk: {random_topk}")
@@ -359,6 +359,8 @@ if __name__ == "__main__":
     
     # Empty cache before model creation
     torch.cuda.empty_cache()
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
     
     model = DeepSeekV3Model(config['model'])
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -367,9 +369,11 @@ if __name__ == "__main__":
     # model.gradient_checkpointing_enable()
     
     model.to(device)
-    model = torch.compile(model)
+    #model = torch.compile(model)
     logger.info(model)
     logger.info("++"*30)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Total parameters: {total_params}")
     
     optimizer = torch.optim.AdamW(
         model.parameters(), 
@@ -382,10 +386,10 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = tokenizer.vocab_size
     
-    # Adjusted batch size and sequence length
+    # Adjusted batch size to 8
     train_loader = load_cosmopedia_dataset(
-        batch_size=16,  # Set to 16
-        seq_length=1024,  # Kept at 1024
+        batch_size=8,  # Changed from 4 to 8
+        seq_length=512,  # Kept at 512
         tokenizer=tokenizer
     )
     
@@ -405,8 +409,8 @@ if __name__ == "__main__":
         optimizer=optimizer, 
         device=device, 
         num_epochs=1, 
-        eval_freq=1000,  # Increase eval frequency to every 500 steps
-        eval_iter=1000,
+        eval_freq=2500,  # Increase eval frequency to every 500 steps
+        eval_iter=2500,
         start_context="Once Upon a Time far far away in a galaxy", 
         tokenizer=tokenizer
     )
